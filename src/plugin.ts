@@ -73,32 +73,41 @@ export default Plugin.define({
 
     let uiServer: UIServer | undefined;
     if (options.uiEnabled !== false) {
-      uiServer = await startUIServer({
-        channel,
-        logger,
-        port: options.uiPort ?? 4700,
-        host: options.uiHost,
-        listModels: async () => {
-          try {
-            const raw = (await context.model?.list?.()) as unknown;
-            const models: Array<Record<string, unknown>> = Array.isArray(raw)
-              ? (raw as Array<Record<string, unknown>>)
-              : ((raw as { data?: Array<Record<string, unknown>> })?.data ?? []);
-            return models.map((m) => ({
-              providerID: String(m.providerID ?? ""),
-              id: String(m.id ?? ""),
-              name: m.name ? String(m.name) : undefined,
-              contextLength:
-                m.limit && typeof m.limit === "object"
-                  ? Number((m.limit as { context?: number }).context ?? 0) || undefined
-                  : undefined,
-              tools: Boolean((m.capabilities as { tools?: boolean } | undefined)?.tools),
-            }));
-          } catch {
-            return [];
-          }
-        },
-      });
+      try {
+        uiServer = await startUIServer({
+          channel,
+          logger,
+          port: options.uiPort ?? 4700,
+          host: options.uiHost,
+          listModels: async () => {
+            try {
+              const raw = (await context.model?.list?.()) as unknown;
+              const models: Array<Record<string, unknown>> = Array.isArray(raw)
+                ? (raw as Array<Record<string, unknown>>)
+                : ((raw as { data?: Array<Record<string, unknown>> })?.data ?? []);
+              return models.map((m) => ({
+                providerID: String(m.providerID ?? ""),
+                id: String(m.id ?? ""),
+                name: m.name ? String(m.name) : undefined,
+                contextLength:
+                  m.limit && typeof m.limit === "object"
+                    ? Number((m.limit as { context?: number }).context ?? 0) || undefined
+                    : undefined,
+                tools: Boolean((m.capabilities as { tools?: boolean } | undefined)?.tools),
+              }));
+            } catch {
+              return [];
+            }
+          },
+        });
+      } catch (err) {
+        // 插件按位置加载：多个位置并行加载时端口可能被占（服务已在别处启动）。
+        // UI 服务不可用不应影响命令与工作流本身。
+        logger.warn(
+          { err, port: options.uiPort ?? 4700 },
+          "UI 桥接服务启动失败（可能已有实例运行），本次仅禁用 UI，命令不受影响",
+        );
+      }
     }
 
     await context.command.transform((editor) => {
