@@ -6,12 +6,14 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Checkpoint, Store } from "../ports";
 import type { IssueLedgerEntry } from "../protocols";
+import type { UIEvent, UIEventEnvelope } from "../protocols/ui-event";
 
 interface Shape {
   checkpoints: Record<string, Checkpoint[]>;
   issues: Record<string, Record<string, IssueLedgerEntry>>;
   sessionRefs: Record<string, Array<{ role: string; sessionKey: string }>>;
   meta: Record<string, Record<string, unknown>>;
+  events: Record<string, UIEventEnvelope[]>;
 }
 
 export class JsonFileStore implements Store {
@@ -20,7 +22,7 @@ export class JsonFileStore implements Store {
 
   constructor(file: string) {
     this.#file = file;
-    this.#data = { checkpoints: {}, issues: {}, sessionRefs: {}, meta: {} };
+    this.#data = { checkpoints: {}, issues: {}, sessionRefs: {}, meta: {}, events: {} };
     try {
       this.#data = { ...this.#data, ...(JSON.parse(fs.readFileSync(file, "utf8")) as Shape) };
     } catch {
@@ -84,6 +86,27 @@ export class JsonFileStore implements Store {
 
   async getMeta<T = unknown>(runId: string, key: string): Promise<T | undefined> {
     return this.#data.meta[runId]?.[key] as T | undefined;
+  }
+
+  async appendEvents(runId: string, events: readonly UIEvent[]): Promise<UIEventEnvelope[]> {
+    const list = (this.#data.events[runId] ??= []);
+    const out: UIEventEnvelope[] = [];
+    for (const event of events) {
+      const envelope: UIEventEnvelope = {
+        seq: (list[list.length - 1]?.seq ?? 0) + 1,
+        runId,
+        at: new Date().toISOString(),
+        event,
+      };
+      list.push(envelope);
+      out.push(envelope);
+    }
+    this.#persist();
+    return out;
+  }
+
+  async listEvents(runId: string, since: number, limit = 1000): Promise<UIEventEnvelope[]> {
+    return (this.#data.events[runId] ?? []).filter((e) => e.seq > since).slice(0, limit);
   }
 
   async close(): Promise<void> {

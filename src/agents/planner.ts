@@ -4,6 +4,7 @@ import {
   AnalysisResultSchema,
   PlanSchema,
   type AnalysisResult,
+  type IssueLedgerEntry,
   type Plan,
   type ReviewResult,
   type TestReport,
@@ -86,6 +87,54 @@ export class Planner {
     });
     return { plan: validatePlan(result.value), usage: usageOf(result) };
   }
+
+  /**
+   * 旁路对话（v1.1 §5.2 / FR-03）：用户在侧栏与思考模型直接对话。
+   * 回答是纯文本建议——**不得直接执行代码修改**，约束由提示词 + 调用方保证。
+   */
+  async sideChat(input: {
+    context: {
+      requirement: string;
+      analysis?: AnalysisResult;
+      plan?: Plan;
+      review?: ReviewResult;
+      reports: readonly TestReport[];
+      issues: readonly IssueLedgerEntry[];
+    };
+    history: Array<{ role: "user" | "assistant"; content: string }>;
+    message: string;
+  }): Promise<{ reply: string; usage: UsageLike }> {
+    const contextText = [
+      `需求：${input.context.requirement}`,
+      input.context.analysis ? `分析结果：${JSON.stringify(input.context.analysis, null, 2)}` : "",
+      input.context.plan ? `当前方案：${JSON.stringify(input.context.plan, null, 2)}` : "",
+      input.context.review ? `最近评审：${JSON.stringify(input.context.review, null, 2)}` : "",
+      `测试证据：${JSON.stringify(input.context.reports, null, 2)}`,
+      `问题台账：${JSON.stringify(input.context.issues, null, 2)}`,
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+
+    const response = await this.gateway.generate({
+      role: "planner",
+      system: SYSTEM,
+      prompt: this.prompts.render("planner-chat", {
+        context: contextText,
+        history: input.history
+          .map((m) => `${m.role === "user" ? "用户" : "思考模型"}：${m.content}`)
+          .join("\n"),
+        message: input.message,
+      }),
+    });
+    return {
+      reply: response.text.trim(),
+      usage: usageOf({
+        inputTokens: response.inputTokens ?? 0,
+        outputTokens: response.outputTokens ?? 0,
+        costUsd: response.costUsd ?? 0,
+      }),
+    };
+  }
 }
 
 /** 技术栈锁定（§2）：任务语言必须与计划语言一致。 */
@@ -116,12 +165,20 @@ export interface UsageLike {
   inputTokens: number;
   outputTokens: number;
   costUsd: number;
+  /** 实际使用的模型（v1.1 §6.3 审计）。 */
+  model?: { providerID: string; id: string };
 }
 
 export function usageOf(r: {
   inputTokens: number;
   outputTokens: number;
   costUsd: number;
+  model?: { providerID: string; id: string };
 }): UsageLike {
-  return { inputTokens: r.inputTokens, outputTokens: r.outputTokens, costUsd: r.costUsd };
+  return {
+    inputTokens: r.inputTokens,
+    outputTokens: r.outputTokens,
+    costUsd: r.costUsd,
+    model: r.model,
+  };
 }

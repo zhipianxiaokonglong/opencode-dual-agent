@@ -22,6 +22,7 @@ export interface StructuredResult<T> {
   outputTokens: number;
   costUsd: number;
   attempts: number;
+  model?: { providerID: string; id: string };
 }
 
 export class StructuredOutputError extends Error {
@@ -61,6 +62,7 @@ export async function generateStructured<T>(opts: StructuredCallOptions<T>): Pro
           outputTokens,
           costUsd,
           attempts: attempt,
+          model: response.model,
         };
       }
       lastError = parsed.error.issues

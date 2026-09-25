@@ -7,6 +7,7 @@ import { createRequire } from "node:module";
 import type { DatabaseSync } from "node:sqlite";
 import type { Checkpoint, Store } from "../ports";
 import type { IssueLedgerEntry } from "../protocols";
+import type { UIEvent, UIEventEnvelope } from "../protocols/ui-event";
 import { JsonFileStore } from "./json-store";
 
 const nodeRequire = createRequire(import.meta.url);
@@ -70,6 +71,13 @@ CREATE TABLE IF NOT EXISTS meta (
   key    TEXT NOT NULL,
   value  TEXT NOT NULL,
   PRIMARY KEY (run_id, key)
+);
+CREATE TABLE IF NOT EXISTS events (
+  run_id TEXT NOT NULL,
+  seq    INTEGER NOT NULL,
+  at     TEXT NOT NULL,
+  event  TEXT NOT NULL,
+  PRIMARY KEY (run_id, seq)
 );
 `;
 
@@ -207,6 +215,38 @@ export class SqliteStore implements Store {
       .get(runId, key) as { value: string } | undefined;
     if (!row) return undefined;
     return JSON.parse(row.value) as T;
+  }
+
+  async appendEvents(runId: string, events: readonly UIEvent[]): Promise<UIEventEnvelope[]> {
+    const out: UIEventEnvelope[] = [];
+    for (const event of events) {
+      const row = this.#db
+        .prepare("SELECT COALESCE(MAX(seq), 0) AS seq FROM events WHERE run_id = ?")
+        .get(runId) as { seq: number };
+      const envelope: UIEventEnvelope = {
+        seq: row.seq + 1,
+        runId,
+        at: new Date().toISOString(),
+        event,
+      };
+      this.#db
+        .prepare("INSERT INTO events (run_id, seq, at, event) VALUES (?, ?, ?, ?)")
+        .run(runId, envelope.seq, envelope.at, JSON.stringify(event));
+      out.push(envelope);
+    }
+    return out;
+  }
+
+  async listEvents(runId: string, since: number, limit = 1000): Promise<UIEventEnvelope[]> {
+    const rows = this.#db
+      .prepare("SELECT seq, at, event FROM events WHERE run_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?")
+      .all(runId, since, limit) as Array<{ seq: number; at: string; event: string }>;
+    return rows.map((r) => ({
+      seq: r.seq,
+      runId,
+      at: r.at,
+      event: JSON.parse(r.event) as UIEventEnvelope["event"],
+    }));
   }
 
   #closed = false;

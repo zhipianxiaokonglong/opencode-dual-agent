@@ -12,9 +12,10 @@ import type {
 } from "../src/ports";
 import type { TestReport } from "../src/protocols";
 
-export type FakeKind = "analyze" | "plan" | "replan" | "review";
+export type FakeKind = "analyze" | "plan" | "replan" | "review" | "chat";
 
 export function detectKind(prompt: string): FakeKind {
+  if (prompt.includes("旁路对话")) return "chat";
   if (prompt.includes("架构重规划")) return "replan";
   if (prompt.includes("架构与任务规划")) return "plan";
   if (prompt.includes("需求分析")) return "analyze";
@@ -26,6 +27,7 @@ export interface FakeGatewayOptions {
   plan?: unknown[];
   replan?: unknown[];
   review?: unknown[];
+  chat?: string[];
   /** 自定义失败输出（用于结构化重试测试）。 */
   raw?: Partial<Record<FakeKind, string[]>>;
 }
@@ -196,4 +198,28 @@ export function findingFixture(issueId: string, severity: "blocker" | "major" | 
     suggestedFix: "补充空值判断",
     requiredRegressionTest: "tests/index.test.ts 增加空值用例",
   };
+}
+
+/** 假审批闸门。 */
+export class FakeApprovals {
+  planQueue: Array<"approve" | "reject" | "cancel"> = [];
+  operationQueue: boolean[] = [];
+  answers: string[] = [];
+  asked: string[][] = [];
+  operations: Array<{ kind: string; detail: string }> = [];
+
+  async requestPlanApproval(): Promise<"approve" | "reject" | "cancel"> {
+    return this.planQueue.shift() ?? "approve";
+  }
+
+  async askUser(questions: string[]): Promise<Record<string, string>> {
+    this.asked.push(questions);
+    const answer = this.answers.shift() ?? "ok";
+    return Object.fromEntries(questions.map((q) => [q, answer]));
+  }
+
+  async requestOperation(req: { kind: string; detail: string }): Promise<boolean> {
+    this.operations.push(req);
+    return this.operationQueue.shift() ?? true;
+  }
 }

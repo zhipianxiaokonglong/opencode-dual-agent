@@ -1,10 +1,12 @@
 /**
  * OpenCode 插件入口（§3.2 plugin.ts）：
- * 事件接入、交互入口（启动/审批/取消/报告），不承载核心业务逻辑。
+ * 事件接入、交互入口（启动/审批/取消/报告）、v1.1 UI 通道装配，不承载核心业务逻辑。
  * 注册命令：
  *   /dual <需求>      启动双模型协作开发闭环
  *   /dual-probe       P1 六项能力验证
  *   /dual-resume      从最近检查点恢复运行
+ *
+ * v1.1：插件 RPC（dual-agent）+ 本地 UI 桥接服务（默认 http://127.0.0.1:4700）。
  */
 import * as path from "node:path";
 import { Plugin } from "@opencode/plugin";
@@ -17,14 +19,18 @@ import {
   type OpenCodeContextLike,
 } from "./adapters/opencode-adapter";
 import { RecursionGuard } from "./adapters/recursion-guard";
+import { runWorkflow, type ModelControl, type RunHandle } from "./orchestrator/workflow";
+import { UIChannel } from "./adapters/ui-channel-adapter";
 import { formatCapabilityReport, probeCapabilities } from "./adapters/capability-probe";
+import { ModelSettings } from "./config/model-settings";
 import { FileWorkspace } from "./workspace";
 import { LocalVerifier } from "./verification";
 import { createStore } from "./storage";
 import { FilePromptSource } from "./prompts";
 import { createLogger } from "./logging";
-import { runWorkflow } from "./orchestrator/workflow";
 import { buildReport } from "./reporting";
+import { DualAgent } from "./rpc";
+import { startUIServer, type UIServer } from "./ui/server";
 
 interface DualAgentOptions {
   plannerModel?: ModelRefLike;
@@ -38,6 +44,10 @@ interface DualAgentOptions {
   /** CI / 无人值守：自动审批计划与操作。 */
   autoApprove?: boolean;
   logLevel?: string;
+  /** v1.1：UI 桥接服务（默认 127.0.0.1:4700；uiEnabled=false 关闭）。 */
+  uiEnabled?: boolean;
+  uiPort?: number;
+  uiHost?: string;
 }
 
 export default Plugin.define({
@@ -46,6 +56,47 @@ export default Plugin.define({
     const context = ctx as unknown as OpenCodeContextLike;
     const options = (context.options ?? {}) as DualAgentOptions;
     const logger: Logger = createLogger({ level: options.logLevel ?? "info" });
+
+    // ---------------- v1.1：UI 通道（RPC + 本地桥接服务） ----------------
+    const channel = new UIChannel(logger);
+    const modelSettings = ModelSettings.load(
+      path.join(context.location.directory, ".opencode", "dual-agent", "models.json"),
+    );
+    let rpcDispose: (() => Promise<void>) | undefined;
+    if (typeof context.rpc?.register === "function") {
+      const registration = await context.rpc.register(DualAgent, channel.handlers() as unknown as Record<string, unknown>);
+      channel.attachEmitter(async (envelope) => {
+        await registration.events.emit("ui", envelope as unknown);
+      });
+      rpcDispose = () => registration.dispose();
+    }
+
+    let uiServer: UIServer | undefined;
+    if (options.uiEnabled !== false) {
+      uiServer = await startUIServer({
+        channel,
+        logger,
+        port: options.uiPort ?? 4700,
+        host: options.uiHost,
+        listModels: async () => {
+          try {
+            const models = ((await context.model?.list?.()) ?? []) as Array<Record<string, unknown>>;
+            return models.map((m) => ({
+              providerID: String(m.providerID ?? ""),
+              id: String(m.id ?? ""),
+              name: m.name ? String(m.name) : undefined,
+              contextLength:
+                m.limit && typeof m.limit === "object"
+                  ? Number((m.limit as { context?: number }).context ?? 0) || undefined
+                  : undefined,
+              tools: Boolean((m.capabilities as { tools?: boolean } | undefined)?.tools),
+            }));
+          } catch {
+            return [];
+          }
+        },
+      });
+    }
 
     await context.command.transform((editor) => {
       editor.add({
@@ -57,7 +108,11 @@ export default Plugin.define({
             await safeSynthetic(context, input.sessionID, "用法：/dual <需求描述>");
             return;
           }
-          await startRun(context, logger, options, input.sessionID, requirement, { resume: false });
+          await startRun(context, logger, options, input.sessionID, requirement, {
+            resume: false,
+            channel,
+            modelSettings,
+          });
         },
       });
 
@@ -87,13 +142,22 @@ export default Plugin.define({
             await safeSynthetic(context, input.sessionID, "用法：/dual-resume <原始需求描述>");
             return;
           }
-          await startRun(context, logger, options, input.sessionID, requirement, { resume: true });
+          await startRun(context, logger, options, input.sessionID, requirement, {
+            resume: true,
+            channel,
+            modelSettings,
+          });
         },
       });
     });
 
-    logger.info({ directory: context.location?.directory }, "opencode-dual-agent 插件已加载");
+    logger.info(
+      { directory: context.location?.directory, ui: uiServer ? `http://127.0.0.1:${uiServer.port}` : "disabled" },
+      "opencode-dual-agent 插件已加载（v1.1 UI 通道就绪）",
+    );
     return async () => {
+      await uiServer?.close();
+      await rpcDispose?.();
       logger.info({}, "opencode-dual-agent 插件卸载");
     };
   },
@@ -105,7 +169,11 @@ async function startRun(
   options: DualAgentOptions,
   sessionID: string,
   requirement: string,
-  opts: { resume: boolean },
+  opts: {
+    resume: boolean;
+    channel: UIChannel;
+    modelSettings: ModelSettings;
+  },
 ): Promise<RunResult> {
   const projectDir = ctx.location.project?.directory ?? ctx.location.directory;
   const dataDir = path.join(projectDir, ".opencode", "dual-agent");
@@ -117,6 +185,31 @@ async function startRun(
   );
   const guard = new RecursionGuard(runId, store);
   const workspaceBase = options.workspaceBase ?? path.join(dataDir, "workspaces");
+  const fallbackModel: ModelRefLike = options.plannerModel ?? { providerID: "xiaomi", id: "mimo-v2.6-pro" };
+
+  // v1.1：模型三级优先级（任务 > 项目 > 全局），调用点解析 → 切换在下一阶段生效（§6.3）
+  const taskModels: Record<"planner" | "coder", ModelRefLike | null> = { planner: null, coder: null };
+  const modelControl: ModelControl = {
+    current: () => ({
+      planner: opts.modelSettings.resolve("planner", projectDir, taskModels.planner),
+      coder: opts.modelSettings.resolve("coder", projectDir, taskModels.coder),
+    }),
+    apply: ({ channel: ch, model, scope }) => {
+      const ref = model && model.providerID ? (model as ModelRefLike) : null;
+      if (scope === "task") taskModels[ch] = ref;
+      else if (scope === "project") opts.modelSettings.setProjectOverride(ch, projectDir, ref);
+      else opts.modelSettings.setDefault(ch, ref);
+      return { model: ref, effectiveFrom: "next-stage" };
+    },
+  };
+
+  const runHandle: RunHandle = {
+    attach(controller, bus) {
+      opts.channel.register(controller);
+      opts.channel.attachBus(runId, bus);
+      bus.subscribe(opts.channel.sink());
+    },
+  };
 
   let workspace: FileWorkspace | undefined;
   try {
@@ -132,10 +225,13 @@ async function startRun(
 
     const gateway = new RoleModelGateway(
       createTextGenerator(ctx),
-      {
-        planner: options.plannerModel,
-        reviewer: options.plannerModel,
-        default: options.plannerModel ?? { providerID: "anthropic", id: "claude-sonnet-4-6" },
+      () => {
+        const current = modelControl.current();
+        return {
+          planner: current.planner ?? options.plannerModel ?? fallbackModel,
+          reviewer: current.planner ?? options.plannerModel ?? fallbackModel,
+          default: options.plannerModel ?? fallbackModel,
+        };
       },
       logger,
     );
@@ -150,13 +246,9 @@ async function startRun(
       onTimeout: "reject",
     });
 
-    const coder = new SessionCoderExecutor(
-      ctx,
-      new FilePromptSource(),
-      logger,
-      guard,
-      { model: options.coderModel },
-    );
+    const coder = new SessionCoderExecutor(ctx, new FilePromptSource(), logger, guard, {
+      model: () => modelControl.current().coder ?? options.coderModel ?? null,
+    });
 
     const result = await runWorkflow(
       {
@@ -175,6 +267,8 @@ async function startRun(
           maxTokens: options.maxTokens,
         },
         runId,
+        runHandle,
+        modelControl,
       },
       { requirement, resume: opts.resume },
     );

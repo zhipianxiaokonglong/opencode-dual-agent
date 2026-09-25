@@ -2,6 +2,12 @@
  * 工作流编排器（§3.2 orchestrator/、§4 状态机）：
  * 需求 → 分析 → 规划 → 审批 → 实现 → 真实测试 → 评审 →（≤N 轮修复）→ 报告。
  * 模型负责判断，程序负责约束，工具负责证据；任何"完成"结论绑定真实测试结果。
+ *
+ * v1.1 增量：
+ * - UI 事件总线（先落库后推送，§4.2）
+ * - 用户介入策略与 CONSULTING 状态（§5.2）
+ * - 旁路对话（FR-03，只产出建议，不执行修改）
+ * - 模型切换审计（§6.3，阶段 → 实际使用模型）
  */
 import { randomUUID } from "node:crypto";
 import type {
@@ -25,13 +31,31 @@ import {
   type TaskPackage,
   type TestReport,
 } from "../protocols";
+import type { ModelRef, UIEvent } from "../protocols/ui-event";
 import type { PromptSource } from "../prompts";
 import { Planner, type UsageLike } from "../agents/planner";
 import { Reviewer } from "../agents/reviewer";
 import { detectTestTampering } from "../security/permissions";
 import { BudgetTracker, DEFAULT_BUDGET, NoProgressTracker, type BudgetConfig, type ProgressSignature } from "./budget";
 import { saveCheckpoint, restoreRun, type CheckpointPayload } from "./recovery";
-import { WorkflowMachine, type WorkflowState } from "./transitions";
+import { EventBus } from "./event-bus";
+import { PauseController, classifyIntervention } from "./interventions";
+import { WorkflowMachine, isTerminal, type WorkflowEvent, type WorkflowState } from "./transitions";
+import type { WorkflowController, RunStatus, ModelChannelName, ModelScope } from "../adapters/ui-channel-adapter";
+import { exportProcessMarkdown } from "../reporting";
+
+export interface ModelControl {
+  current(): Record<string, ModelRef | null>;
+  apply(input: {
+    channel: ModelChannelName;
+    model: ModelRef | null;
+    scope: ModelScope;
+  }): { model: ModelRef | null; effectiveFrom: string };
+}
+
+export interface RunHandle {
+  attach(controller: WorkflowController, bus: EventBus): void;
+}
 
 export interface WorkflowDeps {
   gateway: ModelGateway;
@@ -46,6 +70,10 @@ export interface WorkflowDeps {
   budget?: Partial<BudgetConfig>;
   runId?: string;
   signal?: AbortSignal;
+  /** v1.1：UI 运行装配入口。 */
+  runHandle?: RunHandle;
+  /** v1.1：模型设置（任务/项目/全局）。 */
+  modelControl?: ModelControl;
 }
 
 export interface WorkflowOptions {
@@ -88,6 +116,35 @@ export async function runWorkflow(deps: WorkflowDeps, options: WorkflowOptions):
   let round = 0;
   let stopReason: string | undefined;
 
+  // ---------------- v1.1：UI 事件总线 / 暂停 / 模型审计 ----------------
+  const bus = new EventBus(deps.store, runId);
+  const stageModels: Record<string, string> = {};
+  const chatLog: Array<{ role: "user" | "assistant"; content: string }> = [];
+
+  const ui = async (event: UIEvent): Promise<void> => {
+    await bus.emit(event).catch((err: unknown) => {
+      deps.logger.warn({ err }, "UI 事件落库失败");
+    });
+  };
+
+  const recordUsage = (phase: string, usage: UsageLike) => {
+    addUsage(usage);
+    if (usage.model) stageModels[phase] = `${usage.model.providerID}/${usage.model.id}`;
+  };
+
+  const pause = new PauseController({
+    onPause: (reason) => ui({ type: "workflow.paused", reason }),
+    onResume: (reason) => ui({ type: "workflow.resumed", reason }),
+  });
+
+  /** 状态机跳转 + 阶段时间线事件。 */
+  const send = async (event: WorkflowEvent, note = ""): Promise<WorkflowState> => {
+    const to = machine.send(event);
+    await ui({ type: "stage.changed", stage: to, at: new Date(clock.now()).toISOString(), note });
+    return to;
+  };
+  const canSend = (event: WorkflowEvent): boolean => machine.can(event);
+
   const usageTotals = { inputTokens: 0, outputTokens: 0, costUsd: 0 };
   const addUsage = (u: UsageLike) => {
     budget.addUsage(u);
@@ -119,7 +176,7 @@ export async function runWorkflow(deps: WorkflowDeps, options: WorkflowOptions):
     });
   };
 
-  const finish = (): RunResult => {
+  const finish = async (): Promise<RunResult> => {
     const statusMap: Record<string, RunResult["status"]> = {
       COMPLETED: "completed",
       STOPPED: "stopped",
@@ -127,9 +184,16 @@ export async function runWorkflow(deps: WorkflowDeps, options: WorkflowOptions):
       CANCELLED: "cancelled",
       FAILED: "failed",
     };
+    const status = statusMap[machine.state] ?? "failed";
+    await ui({
+      type: "run.finished",
+      runId,
+      status,
+      summary: stopReason ?? state.review?.summary ?? "",
+    });
     return {
       runId,
-      status: statusMap[machine.state] ?? "failed",
+      status,
       state: machine.state,
       roundsUsed: round,
       analysis: state.analysis,
@@ -148,6 +212,7 @@ export async function runWorkflow(deps: WorkflowDeps, options: WorkflowOptions):
         outputTokens: usageTotals.outputTokens,
         costUsd: usageTotals.costUsd,
       },
+      stageModels,
       stopReason,
     };
   };
@@ -156,7 +221,71 @@ export async function runWorkflow(deps: WorkflowDeps, options: WorkflowOptions):
     if (machine.can("CANCEL")) machine.send("CANCEL");
   };
 
+  // ---------------- v1.1：运行控制器（UI 命令入口） ----------------
+  const controller: WorkflowController = {
+    status: (): RunStatus => ({
+      runId,
+      state: machine.state,
+      stage: machine.state,
+      round,
+      running: !isTerminal(machine.state),
+      paused: pause.paused,
+      models: deps.modelControl?.current() ?? {},
+    }),
+    chat: async (message: string) => {
+      const action = classifyIntervention(machine.state);
+      await ui({ type: "chat.message", channel: "planner", role: "user", content: message });
+      chatLog.push({ role: "user", content: message });
+
+      if (action === "consult") {
+        pause.request(`用户介入咨询：${message.slice(0, 80)}`);
+      }
+
+      // 思考模型只产出建议/计划；不得直接执行代码修改（§5.2）
+      const { reply } = await planner.sideChat({
+        context: {
+          requirement: state.requirement,
+          analysis: state.analysis,
+          plan: state.plan,
+          review: state.review,
+          reports: state.reports,
+          issues: state.issues,
+        },
+        history: chatLog.slice(-12, -1),
+        message,
+      });
+      chatLog.push({ role: "assistant", content: reply });
+      await ui({ type: "chat.message", channel: "planner", role: "assistant", content: reply });
+      return { reply, action };
+    },
+    setModel: (input) => {
+      const result = deps.modelControl?.apply(input) ?? { model: input.model, effectiveFrom: "next-stage" };
+      // 运行中切换不热切换：当前阶段完成后生效（§6.3）
+      void ui({
+        type: "model.changed",
+        channel: input.channel,
+        model: input.model ?? { providerID: "", id: "" },
+      });
+      return result;
+    },
+    pause: (reason?: string) => pause.request(reason ?? "user-paused"),
+    resume: () => pause.resume(),
+    exportMarkdown: async () =>
+      exportProcessMarkdown({
+        runId,
+        requirement: state.requirement,
+        state: machine.state,
+        round,
+        stageModels,
+        events: await bus.since(0),
+        chatLog,
+      }),
+  };
+  deps.runHandle?.attach(controller, bus);
+
   try {
+    await ui({ type: "run.started", runId, requirement: options.requirement });
+
     // ---------------- 恢复（§8.5） ----------------
     if (options.resume) {
       const restored = await restoreRun(deps.store, runId);
@@ -184,23 +313,29 @@ export async function runWorkflow(deps: WorkflowDeps, options: WorkflowOptions):
 
     const resumed = machine.state !== "CREATED";
     if (!resumed) {
-      machine.send("START");
+      await send("START");
       await checkpoint();
 
       // ---------------- ANALYZING ----------------
       const materials = await deps.workspace.materials();
       const analyzed = await planner.analyze({ requirement: state.requirement, materials });
-      addUsage(analyzed.usage);
+      recordUsage("ANALYZING", analyzed.usage);
       state.analysis = analyzed.analysis;
+      await ui({
+        type: "planner.output",
+        kind: "analysis",
+        content: analyzed.analysis.understanding,
+        payload: analyzed.analysis,
+      });
 
       if (analyzed.analysis.questions.length > 0) {
-        machine.send("ANALYSIS_QUESTIONS");
+        await send("ANALYSIS_QUESTIONS");
         await checkpoint();
         const answers = await deps.approvals.askUser(analyzed.analysis.questions);
         Object.assign(state.userAnswers, answers);
-        machine.send("USER_RESPONDED");
+        await send("USER_RESPONDED");
       } else {
-        machine.send("ANALYSIS_READY");
+        await send("ANALYSIS_READY");
       }
       await checkpoint();
 
@@ -210,9 +345,15 @@ export async function runWorkflow(deps: WorkflowDeps, options: WorkflowOptions):
         analysis: state.analysis,
         materials,
       });
-      addUsage(planned.usage);
+      recordUsage("PLANNING", planned.usage);
       state.plan = planned.plan;
-      machine.send("PLAN_READY");
+      await ui({
+        type: "planner.output",
+        kind: "plan",
+        content: planned.plan.architecture,
+        payload: planned.plan,
+      });
+      await send("PLAN_READY");
       await checkpoint();
 
       // ---------------- WAITING_APPROVAL ----------------
@@ -222,19 +363,19 @@ export async function runWorkflow(deps: WorkflowDeps, options: WorkflowOptions):
         if (decision === "cancel") {
           cancelled();
           await checkpoint();
-          return finish();
+          return await finish();
         }
         if (decision === "approve") {
-          machine.send("PLAN_APPROVED");
+          await send("PLAN_APPROVED");
           break;
         }
         planRejections += 1;
-        machine.send("PLAN_REJECTED");
+        await send("PLAN_REJECTED");
         if (planRejections >= 2) {
           stopReason = "计划两次被用户拒绝";
-          machine.send("NO_PROGRESS");
+          await send("NO_PROGRESS");
           await checkpoint();
-          return finish();
+          return await finish();
         }
         const feedback = await deps.approvals.askUser(["计划被拒绝：请说明需要调整的方向"]);
         Object.assign(state.userAnswers, feedback);
@@ -251,9 +392,10 @@ export async function runWorkflow(deps: WorkflowDeps, options: WorkflowOptions):
           reports: state.reports,
           materials,
         });
-        addUsage(replanned.usage);
+        recordUsage("REPLANNING", replanned.usage);
         state.plan = replanned.plan;
-        machine.send("REPLAN_DONE");
+        await ui({ type: "planner.output", kind: "fix", content: replanned.plan.notes.join("\n"), payload: replanned.plan });
+        await send("REPLAN_DONE");
         await checkpoint();
         break;
       }
@@ -266,7 +408,7 @@ export async function runWorkflow(deps: WorkflowDeps, options: WorkflowOptions):
       if (deps.signal?.aborted) {
         cancelled();
         await checkpoint();
-        return finish();
+        return await finish();
       }
 
       round += 1;
@@ -274,10 +416,13 @@ export async function runWorkflow(deps: WorkflowDeps, options: WorkflowOptions):
       const budgetStatus = budget.check();
       if (!budgetStatus.ok) {
         stopReason = budgetStatus.detail;
-        machine.send("BUDGET_EXCEEDED");
+        await send("BUDGET_EXCEEDED");
         await checkpoint();
-        return finish();
+        return await finish();
       }
+
+      // 安全点（§5.2）：暂停在原子操作之间生效
+      await pause.safePoint(`round-${round}-start`);
 
       // ---------------- IMPLEMENTING ----------------
       const materials = await deps.workspace.materials();
@@ -287,6 +432,7 @@ export async function runWorkflow(deps: WorkflowDeps, options: WorkflowOptions):
         : state.plan!.tasks;
 
       for (const task of tasksToRun) {
+        await pause.safePoint(`task-${task.taskId}`);
         const coderResult = await deps.coder.execute({
           workspace: deps.workspace,
           round,
@@ -298,6 +444,12 @@ export async function runWorkflow(deps: WorkflowDeps, options: WorkflowOptions):
         for (const f of coderResult.changedFiles) {
           if (!state.changedFiles.includes(f)) state.changedFiles.push(f);
         }
+        await ui({
+          type: "coder.progress",
+          taskId: task.taskId,
+          action: "summary",
+          content: coderResult.summary,
+        });
       }
 
       const revision = await deps.workspace.revision();
@@ -324,7 +476,7 @@ export async function runWorkflow(deps: WorkflowDeps, options: WorkflowOptions):
         }
       }
 
-      machine.send("IMPL_DONE");
+      await send("IMPL_DONE");
       await checkpoint();
 
       // ---------------- VERIFYING ----------------
@@ -336,7 +488,10 @@ export async function runWorkflow(deps: WorkflowDeps, options: WorkflowOptions):
         signal: deps.signal ?? new AbortController().signal,
       });
       state.reports = reports;
-      machine.send("VERIFY_DONE");
+      for (const report of reports) {
+        await ui({ type: "test.report", report });
+      }
+      await send("VERIFY_DONE");
       await checkpoint();
 
       // ---------------- REVIEWING ----------------
@@ -347,8 +502,14 @@ export async function runWorkflow(deps: WorkflowDeps, options: WorkflowOptions):
         issues: state.issues,
         materials,
       });
-      addUsage(reviewed.usage);
+      recordUsage("REVIEWING", reviewed.usage);
       state.review = reviewed.review;
+      await ui({
+        type: "planner.output",
+        kind: "review",
+        content: reviewed.review.summary,
+        payload: reviewed.review,
+      });
       mergeFindings(state, reviewed.review, round);
       await deps.store.addIssues(runId, state.issues);
 
@@ -370,11 +531,11 @@ export async function runWorkflow(deps: WorkflowDeps, options: WorkflowOptions):
             );
             if (stalled) {
               stopReason = "连续 2 轮无进展且测试未通过";
-              machine.send("NO_PROGRESS");
+              await send("NO_PROGRESS");
               await checkpoint();
-              return finish();
+              return await finish();
             }
-            machine.send("REVIEW_FIXABLE");
+            await send("REVIEW_FIXABLE");
             await checkpoint();
             break;
           }
@@ -382,25 +543,25 @@ export async function runWorkflow(deps: WorkflowDeps, options: WorkflowOptions):
             if (issue.status !== "wontfix") issue.status = "verified";
           }
           await deps.store.addIssues(runId, state.issues);
-          machine.send("REVIEW_APPROVE");
+          await send("REVIEW_APPROVE");
           await checkpoint();
-          machine.send("FINALIZE_DONE");
+          await send("FINALIZE_DONE");
           await checkpoint();
-          return finish();
+          return await finish();
         }
         case "request_changes": {
           if (stalled) {
             stopReason = "连续 2 轮无进展（同类问题无改善）";
-            machine.send("NO_PROGRESS");
+            await send("NO_PROGRESS");
             await checkpoint();
-            return finish();
+            return await finish();
           }
-          machine.send("REVIEW_FIXABLE");
+          await send("REVIEW_FIXABLE");
           await checkpoint();
           break;
         }
         case "replan": {
-          machine.send("REVIEW_REPLAN");
+          await send("REVIEW_REPLAN");
           await checkpoint();
           const replanned = await planner.replan({
             requirement: state.requirement,
@@ -410,19 +571,20 @@ export async function runWorkflow(deps: WorkflowDeps, options: WorkflowOptions):
             reports,
             materials,
           });
-          addUsage(replanned.usage);
+          recordUsage("REPLANNING", replanned.usage);
           state.plan = replanned.plan;
-          machine.send("REPLAN_DONE");
+          await ui({ type: "planner.output", kind: "fix", content: replanned.plan.notes.join("\n"), payload: replanned.plan });
+          await send("REPLAN_DONE");
           await checkpoint();
           break;
         }
         case "blocked": {
-          machine.send("REVIEW_BLOCKED");
+          await send("REVIEW_BLOCKED");
           await checkpoint();
-          return finish();
+          return await finish();
         }
         case "ask_user": {
-          machine.send("REVIEW_ASK");
+          await send("REVIEW_ASK");
           await checkpoint();
           const questions =
             reviewed.review.questions.length > 0
@@ -430,7 +592,7 @@ export async function runWorkflow(deps: WorkflowDeps, options: WorkflowOptions):
               : ["评审需要用户决策，请给出继续方向"];
           const answers = await deps.approvals.askUser(questions);
           Object.assign(state.userAnswers, answers);
-          machine.send("USER_RESPONDED");
+          await send("USER_RESPONDED");
           await checkpoint();
 
           // 用户答复进入重规划，产出的新计划需重新审批
@@ -445,25 +607,26 @@ export async function runWorkflow(deps: WorkflowDeps, options: WorkflowOptions):
             reports,
             materials,
           });
-          addUsage(replanned.usage);
+          recordUsage("REPLANNING", replanned.usage);
           state.plan = replanned.plan;
-          machine.send("PLAN_READY");
+          await ui({ type: "planner.output", kind: "fix", content: replanned.plan.notes.join("\n"), payload: replanned.plan });
+          await send("PLAN_READY");
           await checkpoint();
 
           const decision = await deps.approvals.requestPlanApproval(state.plan!);
           if (decision === "cancel") {
             cancelled();
             await checkpoint();
-            return finish();
+            return await finish();
           }
           if (decision !== "approve") {
             stopReason = "重规划后的计划被用户拒绝";
-            machine.send("PLAN_REJECTED");
-            machine.send("NO_PROGRESS");
+            await send("PLAN_REJECTED");
+            await send("NO_PROGRESS");
             await checkpoint();
-            return finish();
+            return await finish();
           }
-          machine.send("PLAN_APPROVED");
+          await send("PLAN_APPROVED");
           await checkpoint();
           break;
         }
@@ -472,9 +635,9 @@ export async function runWorkflow(deps: WorkflowDeps, options: WorkflowOptions):
   } catch (err) {
     stopReason = err instanceof Error ? err.message : String(err);
     deps.logger.error({ runId, err: stopReason }, "工作流异常终止");
-    if (machine.can("ERROR")) machine.send("ERROR");
+    if (canSend("ERROR")) await send("ERROR");
     await checkpoint().catch(() => {});
-    return finish();
+    return await finish();
   }
 }
 

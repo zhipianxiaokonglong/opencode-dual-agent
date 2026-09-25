@@ -52,6 +52,18 @@ export interface OpenCodeContextLike {
     rules?(input: Record<string, unknown>): Promise<void>;
     list(input?: Record<string, unknown>): Promise<unknown>;
   };
+  model?: {
+    list(input?: Record<string, unknown>): Promise<unknown>;
+  };
+  rpc: {
+    register(
+      definition: unknown,
+      handlers: Record<string, unknown>,
+    ): Promise<{
+      events: { emit(name: string, data: unknown): Promise<void> };
+      dispose(): Promise<void>;
+    }>;
+  };
   event: {
     subscribe(options?: { signal?: AbortSignal }): AsyncIterable<{ type: string; [key: string]: unknown }>;
   };
@@ -82,8 +94,8 @@ export function createTextGenerator(ctx: OpenCodeContextLike): TextGenerator {
 // ---------------------------------------------------------------------------
 
 export interface SessionCoderOptions {
-  /** Coder 使用的模型（按角色指定）。 */
-  model?: { providerID: string; id: string };
+  /** Coder 使用的模型（按角色指定）；支持函数实现"切换在下一阶段生效"（§6.3）。 */
+  model?: { providerID: string; id: string } | (() => { providerID: string; id: string } | null | undefined);
   /** 会话内单次任务的最大等待时间。 */
   timeoutMs?: number;
 }
@@ -135,17 +147,24 @@ export class SessionCoderExecutor implements CoderExecutor {
 
   private async ensureSession(workspaceRoot: string): Promise<string> {
     const existing = this.coderSessions.get(workspaceRoot);
-    if (existing) return existing;
+    const model = typeof this.options.model === "function" ? this.options.model() : this.options.model;
+    if (existing) {
+      // 模型切换语义（§6.3）：调用点解析，下次执行生效
+      if (model && this.ctx.session.switchModel) {
+        await this.ctx.session.switchModel({ sessionID: existing, model });
+      }
+      return existing;
+    }
     const created = await this.ctx.session.create({
       title: `dual-agent coder (${path.basename(workspaceRoot)})`,
       // 能力探测项：指定工作目录（不同版本字段可能不同，见 docs/P1-verification.md）
       directory: workspaceRoot,
       worktree: workspaceRoot,
     });
-    if (this.options.model && this.ctx.session.switchModel) {
+    if (model && this.ctx.session.switchModel) {
       await this.ctx.session.switchModel({
         sessionID: created.id,
-        model: this.options.model,
+        model,
       });
     }
     this.coderSessions.set(workspaceRoot, created.id);

@@ -24,6 +24,8 @@ export interface ModelResponse {
   inputTokens?: number;
   outputTokens?: number;
   costUsd?: number;
+  /** 实际使用的模型（§6.3 审计：报告标注每个阶段实际使用的模型）。 */
+  model?: { providerID: string; id: string };
 }
 
 /** 模型网关：按角色调用思考模型（结构化输出由 agents 层解析）。 */
@@ -124,7 +126,9 @@ export interface Checkpoint {
   payload: unknown;
 }
 
-/** 持久化层（SQLite 落地，接口可替换）：状态、产物、预算、检查点。 */
+export type { UIEvent, UIEventEnvelope } from "./protocols/ui-event";
+
+/** 持久化层（SQLite 落地，接口可替换）：状态、产物、预算、检查点、UI 事件流。 */
 export interface Store {
   saveCheckpoint(cp: Checkpoint): Promise<void>;
   latestCheckpoint(runId: string): Promise<Checkpoint | undefined>;
@@ -135,6 +139,10 @@ export interface Store {
   listSessionRefs(runId: string): Promise<Array<{ role: string; sessionKey: string }>>;
   setMeta(runId: string, key: string, value: unknown): Promise<void>;
   getMeta<T = unknown>(runId: string, key: string): Promise<T | undefined>;
+  /** 追加 UI 事件（先落库），返回带单调序号的信封。 */
+  appendEvents(runId: string, events: readonly import("./protocols/ui-event").UIEvent[]): Promise<import("./protocols/ui-event").UIEventEnvelope[]>;
+  /** 按序号补发（seq 严格大于 since），升序。 */
+  listEvents(runId: string, since: number, limit?: number): Promise<import("./protocols/ui-event").UIEventEnvelope[]>;
   close(): Promise<void>;
 }
 
@@ -160,5 +168,7 @@ export interface RunResult {
     outputTokens: number;
     costUsd: number;
   };
+  /** 阶段 → 实际使用模型（§6.3 审计）。 */
+  stageModels?: Record<string, string>;
   stopReason?: string;
 }
