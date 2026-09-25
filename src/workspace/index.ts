@@ -36,6 +36,7 @@ export class FileWorkspace implements Workspace {
 
     if (mode === "worktree") {
       await run("git", ["worktree", "add", "--detach", root], opts.source);
+      await linkNodeModules(opts.source, root);
       return new FileWorkspace(
         root,
         async () => {
@@ -47,6 +48,7 @@ export class FileWorkspace implements Workspace {
     }
 
     await copyTree(opts.source, root);
+    await linkNodeModules(opts.source, root);
     return new FileWorkspace(root, () => fs.rm(root, { recursive: true, force: true }), opts.source);
   }
 
@@ -141,6 +143,26 @@ async function isGitRepo(dir: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/**
+ * 依赖目录链接（junction / symlink）：
+ * 工作区副本不复制 node_modules（太大），但验证阶段（npm run test 等）需要依赖。
+ * 链接只读共享源项目的 node_modules；写入由权限层限制在白名单路径内。
+ */
+async function linkNodeModules(source: string, root: string): Promise<void> {
+  const src = path.join(source, "node_modules");
+  const dest = path.join(root, "node_modules");
+  const exists = async (p: string) => {
+    try {
+      await fs.stat(p);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  if (!(await exists(src)) || (await exists(dest))) return;
+  await fs.symlink(src, dest, process.platform === "win32" ? "junction" : "dir");
 }
 
 async function copyTree(src: string, dest: string): Promise<void> {
