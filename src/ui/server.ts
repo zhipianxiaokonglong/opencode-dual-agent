@@ -155,7 +155,19 @@ export async function startUIServer(opts: UIServerOptions): Promise<UIServer> {
     serveStatic(res, staticDir, url.pathname);
   }
 
-  await new Promise<void>((resolve) => server.listen(opts.port ?? 4700, host, resolve));
+  await new Promise<void>((resolve, reject) => {
+    const onError = (err: Error) => {
+      server.removeListener("listening", onListening);
+      reject(err);
+    };
+    const onListening = () => {
+      server.removeListener("error", onError);
+      resolve();
+    };
+    server.once("error", onError);
+    server.once("listening", onListening);
+    server.listen(opts.port ?? 4700, host);
+  });
   const address = server.address();
   const port = typeof address === "object" && address ? address.port : (opts.port ?? 4700);
   opts.logger.info({ host, port }, "v1.1 UI 桥接服务已启动");

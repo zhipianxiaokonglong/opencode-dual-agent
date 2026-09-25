@@ -30,7 +30,7 @@ import { FilePromptSource } from "./prompts";
 import { createLogger } from "./logging";
 import { buildReport } from "./reporting";
 import { DualAgent } from "./rpc";
-import { startUIServer, type UIServer } from "./ui/server";
+import { ensureUIServer, sharedUIChannel, type UIServer } from "./ui/instance";
 
 interface DualAgentOptions {
   plannerModel?: ModelRefLike;
@@ -57,29 +57,30 @@ export default Plugin.define({
     const options = (context.options ?? {}) as DualAgentOptions;
     const logger: Logger = createLogger({ level: options.logLevel ?? "info" });
 
-    // ---------------- v1.1：UI 通道（RPC + 本地桥接服务） ----------------
-    const channel = new UIChannel(logger);
+    // ---------------- v1.1：UI 通道（RPC + 本地桥接服务，进程级共享单例） ----------------
+    const channel = sharedUIChannel(logger);
     const modelSettings = ModelSettings.load(
       path.join(context.location.directory, ".opencode", "dual-agent", "models.json"),
     );
     let rpcDispose: (() => Promise<void>) | undefined;
     if (typeof context.rpc?.register === "function") {
       const registration = await context.rpc.register(DualAgent, channel.handlers() as unknown as Record<string, unknown>);
-      channel.attachEmitter(async (envelope) => {
+      const detachEmitter = channel.attachEmitter(async (envelope) => {
         await registration.events.emit("ui", envelope as unknown);
       });
-      rpcDispose = () => registration.dispose();
+      rpcDispose = async () => {
+        detachEmitter();
+        await registration.dispose();
+      };
     }
 
     let uiServer: UIServer | undefined;
     if (options.uiEnabled !== false) {
-      try {
-        uiServer = await startUIServer({
-          channel,
-          logger,
-          port: options.uiPort ?? 4700,
-          host: options.uiHost,
-          listModels: async () => {
+      uiServer = await ensureUIServer({
+        logger,
+        port: options.uiPort ?? 4700,
+        host: options.uiHost,
+        listModels: async () => {
             try {
               const raw = (await context.model?.list?.()) as unknown;
               const models: Array<Record<string, unknown>> = Array.isArray(raw)
@@ -100,14 +101,6 @@ export default Plugin.define({
             }
           },
         });
-      } catch (err) {
-        // 插件按位置加载：多个位置并行加载时端口可能被占（服务已在别处启动）。
-        // UI 服务不可用不应影响命令与工作流本身。
-        logger.warn(
-          { err, port: options.uiPort ?? 4700 },
-          "UI 桥接服务启动失败（可能已有实例运行），本次仅禁用 UI，命令不受影响",
-        );
-      }
     }
 
     await context.command.transform((editor) => {
@@ -120,11 +113,19 @@ export default Plugin.define({
             await safeSynthetic(context, input.sessionID, "用法：/dual <需求描述>");
             return;
           }
-          await startRun(context, logger, options, input.sessionID, requirement, {
+          // 与请求生命周期解耦：命令立即返回，运行在后台继续（客户端断开不影响）
+          void startRun(context, logger, options, input.sessionID, requirement, {
             resume: false,
             channel,
             modelSettings,
+          }).catch((err: unknown) => {
+            logger.error({ err }, "运行启动失败");
           });
+          await safeSynthetic(
+            context,
+            input.sessionID,
+            `双模型协作已启动，过程见 http://127.0.0.1:${options.uiPort ?? 4700}（完成或需审批时会在此通知）`,
+          );
         },
       });
 
@@ -154,11 +155,15 @@ export default Plugin.define({
             await safeSynthetic(context, input.sessionID, "用法：/dual-resume <原始需求描述>");
             return;
           }
-          await startRun(context, logger, options, input.sessionID, requirement, {
+          // 与请求生命周期解耦（同 /dual）
+          void startRun(context, logger, options, input.sessionID, requirement, {
             resume: true,
             channel,
             modelSettings,
+          }).catch((err: unknown) => {
+            logger.error({ err }, "恢复运行启动失败");
           });
+          await safeSynthetic(context, input.sessionID, "已从检查点恢复运行（后台继续）");
         },
       });
     });
@@ -168,7 +173,7 @@ export default Plugin.define({
       "opencode-dual-agent 插件已加载（v1.1 UI 通道就绪）",
     );
     return async () => {
-      await uiServer?.close();
+      // UI 服务为进程级共享单例，不随单个位置的插件卸载而关闭
       await rpcDispose?.();
       logger.info({}, "opencode-dual-agent 插件卸载");
     };

@@ -47,13 +47,14 @@ export type RpcHandlers = Record<
  */
 export class UIChannel {
   readonly #runs = new Map<string, WorkflowController>();
-  #emit: (envelope: UIEventEnvelope) => Promise<void> = async () => {};
+  readonly #emitters = new Set<(envelope: UIEventEnvelope) => Promise<void>>();
 
   constructor(private readonly logger: Logger) {}
 
-  /** 装配事件发射器（插件 RPC 的 events.emit）。 */
-  attachEmitter(emit: (envelope: UIEventEnvelope) => Promise<void>): void {
-    this.#emit = emit;
+  /** 装配事件发射器（插件 RPC 的 events.emit）；多位置多实例可叠加。 */
+  attachEmitter(emit: (envelope: UIEventEnvelope) => Promise<void>): () => void {
+    this.#emitters.add(emit);
+    return () => this.#emitters.delete(emit);
   }
 
   /** 编排器启动时注册控制器；返回注销函数。 */
@@ -77,9 +78,11 @@ export class UIChannel {
           // 单个订阅者异常不影响其他订阅者
         }
       }
-      void this.#emit(redacted).catch((err: unknown) => {
-        this.logger.warn({ err }, "UI 事件推送失败");
-      });
+      for (const emit of this.#emitters) {
+        void emit(redacted).catch((err: unknown) => {
+          this.logger.warn({ err }, "UI 事件推送失败");
+        });
+      }
     };
   }
 
