@@ -151,4 +151,21 @@ describe("JsonFileStore 降级实现", () => {
     const store = createStore(":memory:", path.join(os.tmpdir(), "dual-fallback.json"));
     expect(store).toBeInstanceOf(SqliteStore);
   });
+
+  it("createStore 自动创建父目录（数据库可直接落在新目录）", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dual-nested-"));
+    const dbPath = path.join(dir, "deep", "nested", "state.sqlite");
+    const store = createStore(dbPath, path.join(dir, "fallback.json"));
+    expect(store).toBeInstanceOf(SqliteStore);
+    await store.saveCheckpoint({
+      runId: "r-nested",
+      state: "CREATED",
+      round: 0,
+      createdAt: new Date().toISOString(),
+      payload: {},
+    });
+    expect((await store.latestCheckpoint("r-nested"))?.runId).toBe("r-nested");
+    await store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
 });

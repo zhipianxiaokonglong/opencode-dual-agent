@@ -8,6 +8,8 @@
  *
  * v1.1：插件 RPC（dual-agent）+ 本地 UI 桥接服务（默认 http://127.0.0.1:4700）。
  */
+import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { Plugin } from "@opencode/plugin";
 import type { Logger, RunResult, Store } from "./ports";
@@ -118,8 +120,11 @@ export default Plugin.define({
             resume: false,
             channel,
             modelSettings,
-          }).catch((err: unknown) => {
-            logger.error({ err }, "运行启动失败");
+          }).catch(async (err: unknown) => {
+            const message = err instanceof Error ? (err.stack ?? err.message) : String(err);
+            logger.error({ err: message }, "运行启动失败");
+            debugLog(`startRun 后台异常: ${message}`);
+            await safeSynthetic(context, input.sessionID, `运行启动失败：${message}`);
           });
           await safeSynthetic(
             context,
@@ -192,9 +197,11 @@ async function startRun(
     modelSettings: ModelSettings;
   },
 ): Promise<RunResult> {
-  const projectDir = ctx.location.project?.directory ?? ctx.location.directory;
+  // 运行目录取**会话所在位置**（用户发起 /dual 的项目），而非插件实例加载位置
+  const projectDir = await resolveSessionDirectory(ctx, sessionID);
   const dataDir = path.join(projectDir, ".opencode", "dual-agent");
   const runId = `run-${Date.now().toString(36)}`;
+  debugLog(`startRun: runId=${runId} projectDir=${projectDir}`);
 
   const store: Store = createStore(
     path.join(dataDir, "state.sqlite"),
@@ -293,8 +300,9 @@ async function startRun(
     await safeSynthetic(ctx, sessionID, buildReport(result));
     return result;
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
+    const message = err instanceof Error ? (err.stack ?? err.message) : String(err);
     logger.error({ err: message }, "运行失败");
+    debugLog(`startRun 内部异常: ${message}`);
     await safeSynthetic(ctx, sessionID, `双模型协作运行失败：${message}`);
     return abortedResult(runId, workspace?.root);
   } finally {
@@ -322,6 +330,40 @@ async function safeSynthetic(
     // 投递失败不影响命令完成；报告内容已生成
     void err;
   }
+}
+
+/** 诊断日志（插件 stdout 不可见时的排查通道，§8：仅记元数据，不记内容）。 */
+function debugLog(message: string): void {
+  try {
+    fs.appendFileSync(
+      path.join(os.tmpdir(), "dual-agent-debug.log"),
+      `${new Date().toISOString()} ${message}\n`,
+      "utf8",
+    );
+  } catch {
+    // 诊断失败不影响主流程
+  }
+}
+
+/** 解析会话所在项目目录；失败时回退到插件实例位置。 */
+async function resolveSessionDirectory(
+  ctx: OpenCodeContextLike,
+  sessionID: string,
+): Promise<string> {
+  try {
+    const info = (await ctx.session.get({ sessionID })) as Record<string, unknown> | undefined;
+    const candidates = [
+      (info as { location?: { directory?: string } })?.location?.directory,
+      (info as { directory?: string })?.directory,
+      (info as { data?: { location?: { directory?: string } } })?.data?.location?.directory,
+    ];
+    for (const dir of candidates) {
+      if (typeof dir === "string" && dir) return dir;
+    }
+  } catch {
+    // 回退
+  }
+  return ctx.location.project?.directory ?? ctx.location.directory;
 }
 
 function abortedResult(runId: string, workspaceRoot?: string): RunResult {

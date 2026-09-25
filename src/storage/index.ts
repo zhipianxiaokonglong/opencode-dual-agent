@@ -4,6 +4,8 @@
  * 通过 createRequire 加载：node:sqlite 仅支持 node: 前缀，打包器需绕过静态解析。
  */
 import { createRequire } from "node:module";
+import * as nodeFs from "node:fs";
+import * as nodePath from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import type { Checkpoint, Store } from "../ports";
 import type { IssueLedgerEntry } from "../protocols";
@@ -31,11 +33,15 @@ function loadSqlite(): (new (path: string) => DatabaseSync) | undefined {
 }
 
 /**
- * 优先 SQLite；运行时不支持 node:sqlite（如部分 Bun 版本）时降级为 JSON 文件存储。
+ * 优先 SQLite；运行时不支持 node:sqlite（如部分 Bun 版本）或打开失败时降级为 JSON 文件存储。
  */
 export function createStore(dbPath: string, fallbackJsonPath: string): Store {
-  const ctor = loadSqlite();
-  if (ctor) return new SqliteStore(dbPath);
+  try {
+    const ctor = loadSqlite();
+    if (ctor) return new SqliteStore(dbPath);
+  } catch {
+    // SQLite 不可用/打不开 → 降级
+  }
   return new JsonFileStore(fallbackJsonPath);
 }
 
@@ -87,6 +93,10 @@ export class SqliteStore implements Store {
   constructor(dbPath: string = ":memory:") {
     const Ctor = loadSqlite();
     if (!Ctor) throw new Error("node:sqlite 不可用");
+    if (dbPath !== ":memory:") {
+      // DatabaseSync 不会创建父目录
+      nodeFs.mkdirSync(nodePath.dirname(dbPath), { recursive: true });
+    }
     this.#db = new Ctor(dbPath);
     this.#db.exec(SCHEMA);
   }

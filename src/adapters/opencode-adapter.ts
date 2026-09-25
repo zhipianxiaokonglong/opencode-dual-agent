@@ -41,6 +41,7 @@ export interface OpenCodeContextLike {
   };
   session: {
     create(input?: Record<string, unknown>): Promise<{ id: string }>;
+    get(input: { sessionID: string }): Promise<unknown>;
     prompt(input: Record<string, unknown>): Promise<unknown>;
     synthetic(input: { sessionID: string; text: string }): Promise<unknown>;
     wait(input: { sessionID: string }): Promise<void>;
