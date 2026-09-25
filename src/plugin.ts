@@ -20,7 +20,7 @@ import { RecursionGuard } from "./adapters/recursion-guard";
 import { formatCapabilityReport, probeCapabilities } from "./adapters/capability-probe";
 import { FileWorkspace } from "./workspace";
 import { LocalVerifier } from "./verification";
-import { SqliteStore } from "./storage";
+import { createStore } from "./storage";
 import { FilePromptSource } from "./prompts";
 import { createLogger } from "./logging";
 import { runWorkflow } from "./orchestrator/workflow";
@@ -112,7 +112,10 @@ async function startRun(
   const dataDir = path.join(projectDir, ".opencode", "dual-agent");
   const runId = `run-${Date.now().toString(36)}`;
 
-  const store: Store = new SqliteStore(path.join(dataDir, "state.sqlite"));
+  const store: Store = createStore(
+    path.join(dataDir, "state.sqlite"),
+    path.join(dataDir, "state.json"),
+  );
   const guard = new RecursionGuard(runId, store);
   const workspaceBase = options.workspaceBase ?? path.join(dataDir, "workspaces");
 

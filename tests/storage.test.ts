@@ -2,7 +2,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { SqliteStore } from "../src/storage";
+import { SqliteStore, createStore } from "../src/storage";
+import { JsonFileStore } from "../src/storage/json-store";
 import { restoreRun, saveCheckpoint } from "../src/orchestrator/recovery";
 
 const stores: SqliteStore[] = [];
@@ -107,5 +108,47 @@ describe("SqliteStore", () => {
     });
     expect(await restoreRun(store, "r3")).toBeUndefined();
     expect(await restoreRun(store, "missing")).toBeUndefined();
+  });
+});
+
+describe("JsonFileStore 降级实现", () => {
+  it("检查点/台账/映射/元数据可持久化", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dual-json-store-"));
+    const file = path.join(dir, "state.json");
+    const store = new JsonFileStore(file);
+    await saveCheckpoint(store, {
+      runId: "r1",
+      state: "IMPLEMENTING",
+      round: 1,
+      payload: { requirement: "x", reports: [], issues: [], changedFiles: [], userAnswers: {} },
+    });
+    await store.addIssues("r1", [
+      {
+        issueId: "ISSUE-001",
+        summary: "s",
+        severity: "major",
+        status: "open",
+        relatedCriteria: [],
+        location: "src/a.ts",
+        round: 1,
+      },
+    ]);
+    await store.putSessionRef("r1", "coder", "ses-1");
+    await store.setMeta("r1", "k", { v: 1 });
+    await store.close();
+
+    const reopened = new JsonFileStore(file);
+    expect((await reopened.latestCheckpoint("r1"))?.state).toBe("IMPLEMENTING");
+    expect((await reopened.listIssues("r1"))[0]?.issueId).toBe("ISSUE-001");
+    await reopened.updateIssueStatus("r1", "ISSUE-001", "fixed");
+    expect((await reopened.listIssues("r1"))[0]?.status).toBe("fixed");
+    expect(await reopened.listSessionRefs("r1")).toEqual([{ role: "coder", sessionKey: "ses-1" }]);
+    expect(await reopened.getMeta("r1", "k")).toEqual({ v: 1 });
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("createStore 优先 SQLite", () => {
+    const store = createStore(":memory:", path.join(os.tmpdir(), "dual-fallback.json"));
+    expect(store).toBeInstanceOf(SqliteStore);
   });
 });

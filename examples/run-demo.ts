@@ -10,7 +10,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { runWorkflow } from "../src/orchestrator/workflow";
-import { SqliteStore } from "../src/storage";
+import { createStore } from "../src/storage";
 import { FilePromptSource } from "../src/prompts";
 import { createLogger } from "../src/logging";
 import { FileWorkspace } from "../src/workspace";
@@ -164,7 +164,7 @@ async function main(): Promise<void> {
     name: "ws",
     mode: "copy",
   });
-  const store = new SqliteStore(path.join(baseDir, "state.sqlite"));
+  const store = createStore(path.join(baseDir, "state.sqlite"), path.join(baseDir, "state.json"));
 
   try {
     const result = await runWorkflow(

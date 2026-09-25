@@ -7,11 +7,36 @@ import { createRequire } from "node:module";
 import type { DatabaseSync } from "node:sqlite";
 import type { Checkpoint, Store } from "../ports";
 import type { IssueLedgerEntry } from "../protocols";
+import { JsonFileStore } from "./json-store";
 
 const nodeRequire = createRequire(import.meta.url);
-const { DatabaseSync: SqliteDatabase } = nodeRequire("node:sqlite") as {
-  DatabaseSync: new (path: string) => DatabaseSync;
-};
+
+let sqliteCtor: (new (path: string) => DatabaseSync) | undefined;
+let sqliteProbed = false;
+
+function loadSqlite(): (new (path: string) => DatabaseSync) | undefined {
+  if (sqliteProbed) return sqliteCtor;
+  sqliteProbed = true;
+  try {
+    sqliteCtor = (
+      nodeRequire("node:sqlite") as {
+        DatabaseSync: new (path: string) => DatabaseSync;
+      }
+    ).DatabaseSync;
+  } catch {
+    sqliteCtor = undefined;
+  }
+  return sqliteCtor;
+}
+
+/**
+ * 优先 SQLite；运行时不支持 node:sqlite（如部分 Bun 版本）时降级为 JSON 文件存储。
+ */
+export function createStore(dbPath: string, fallbackJsonPath: string): Store {
+  const ctor = loadSqlite();
+  if (ctor) return new SqliteStore(dbPath);
+  return new JsonFileStore(fallbackJsonPath);
+}
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS checkpoints (
@@ -52,7 +77,9 @@ export class SqliteStore implements Store {
   readonly #db: DatabaseSync;
 
   constructor(dbPath: string = ":memory:") {
-    this.#db = new SqliteDatabase(dbPath);
+    const Ctor = loadSqlite();
+    if (!Ctor) throw new Error("node:sqlite 不可用");
+    this.#db = new Ctor(dbPath);
     this.#db.exec(SCHEMA);
   }
 
