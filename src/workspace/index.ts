@@ -21,6 +21,17 @@ export interface WorkspaceCreateOptions {
 
 const IGNORED_DIRS = new Set(["node_modules", ".git", "dist", "build", "coverage", ".opencode"]);
 
+/** 工作区复制规模保护：防止误把巨型目录（如用户主目录）当作项目复制。 */
+export class WorkspaceTooLargeError extends Error {
+  constructor(limit: string) {
+    super(`源目录超过工作区复制上限（${limit}），请在正确的项目目录中发起任务`);
+    this.name = "WorkspaceTooLargeError";
+  }
+}
+
+const MAX_COPY_FILES = 10_000;
+const MAX_COPY_BYTES = 500 * 1024 * 1024;
+
 export class FileWorkspace implements Workspace {
   private constructor(
     readonly root: string,
@@ -47,7 +58,12 @@ export class FileWorkspace implements Workspace {
       );
     }
 
-    await copyTree(opts.source, root);
+    try {
+      await copyTree(opts.source, root);
+    } catch (err) {
+      await fs.rm(root, { recursive: true, force: true }).catch(() => {});
+      throw err;
+    }
     await linkNodeModules(opts.source, root);
     return new FileWorkspace(root, () => fs.rm(root, { recursive: true, force: true }), opts.source);
   }
@@ -166,14 +182,31 @@ async function linkNodeModules(source: string, root: string): Promise<void> {
 }
 
 async function copyTree(src: string, dest: string): Promise<void> {
+  const budget = { files: 0, bytes: 0 };
+  await copyTreeInner(src, dest, budget);
+}
+
+async function copyTreeInner(
+  src: string,
+  dest: string,
+  budget: { files: number; bytes: number },
+): Promise<void> {
   await fs.mkdir(dest, { recursive: true });
   const entries = await fs.readdir(src, { withFileTypes: true });
   for (const entry of entries) {
     if (IGNORED_DIRS.has(entry.name)) continue;
     const from = path.join(src, entry.name);
     const to = path.join(dest, entry.name);
-    if (entry.isDirectory()) await copyTree(from, to);
-    else if (entry.isFile()) await fs.copyFile(from, to);
+    if (entry.isDirectory()) {
+      await copyTreeInner(from, to, budget);
+    } else if (entry.isFile()) {
+      budget.files += 1;
+      if (budget.files > MAX_COPY_FILES) throw new WorkspaceTooLargeError(`${MAX_COPY_FILES} 个文件`);
+      const stat = await fs.stat(from);
+      budget.bytes += stat.size;
+      if (budget.bytes > MAX_COPY_BYTES) throw new WorkspaceTooLargeError(`${MAX_COPY_BYTES} 字节`);
+      await fs.copyFile(from, to);
+    }
   }
 }
 

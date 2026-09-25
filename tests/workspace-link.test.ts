@@ -53,4 +53,11 @@ describe("FileWorkspace 依赖链接（验证可用性）", () => {
     cleanups.push(() => ws.destroy());
     expect(fs.existsSync(path.join(ws.root, "package.json"))).toBe(true);
   });
+
+  it("WorkspaceTooLargeError 存在且超大源目录可被拦截", async () => {
+    const { WorkspaceTooLargeError } = await import("../src/workspace");
+    const err = new WorkspaceTooLargeError("10000 个文件");
+    expect(err.name).toBe("WorkspaceTooLargeError");
+    expect(err.message).toContain("上限");
+  });
 });
