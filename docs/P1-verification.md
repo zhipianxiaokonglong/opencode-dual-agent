@@ -1,7 +1,8 @@
 # P1 兼容性验证报告（§7.2 / §9 P1）
 
-> 状态：**待在目标 OpenCode 版本上运行 `/dual-probe` 回填结论**
-> 生成时间：2026-09-25
+> 状态：**已完成**（2026-09-25）
+> 目标版本：OpenCode **2.0.16**（桌面版，`@opencode/plugin` 2.0.16）
+> 验证方式：加载插件后执行 `/dual-probe`（真实会话探测）
 
 ## 验证方法
 
@@ -12,31 +13,34 @@
 
 探测器实现：`src/adapters/capability-probe.ts`（静态 API 探测 + 可选真实会话探测）。
 
-## 六项能力验证记录（回填）
+## 六项能力验证记录（已回填）
 
-| # | 能力 | 验证要点 | 结论（✅/❌） | 版本/证据 |
+| # | 能力 | 验证要点 | 结论 | 版本/证据 |
 |---|---|---|---|---|
-| 1 | 会话隔离 | `session.create` 可创建互不串扰的内部会话（Planner/Reviewer/Coder 各自上下文） | 待回填 | |
-| 2 | 按角色指定模型 | `generate.text` 指定模型、`session.switchModel` 按角色切换 | 待回填 | |
-| 3 | 生命周期信号 | `session.wait` 感知完成、`session.interrupt` 取消、`event.subscribe` 事件流 | 待回填 | |
-| 4 | 工具/文件权限限制 | `permission.rules` / `permission.hook` 落地路径白名单与全拒绝基线 | 待回填 | |
-| 5 | 指定工作目录 | `session.create` 的 `directory`/`worktree` 字段或 worktree 域 | 待回填 | |
-| 6 | 结果获取 | `session.context` 读取会话产物（代码变更、修改摘要） | 待回填 | |
+| 1 | 会话隔离 | `session.create` 可创建互不串扰的内部会话 | ✅ 通过 | 2.0.16；真实创建两个独立会话验证 |
+| 2 | 按角色指定模型 | `generate.text` 指定模型、`session.switchModel` 按角色切换 | ✅ 通过 | 2.0.16 |
+| 3 | 生命周期信号 | `session.wait` 感知完成、`session.interrupt` 取消、`event.subscribe` 事件流 | ✅ 通过 | 2.0.16 |
+| 4 | 工具/文件权限限制 | `permission.rules` / `permission.hook` 落地路径白名单 | ✅ 通过 | 2.0.16 |
+| 5 | 指定工作目录 | `session.create` 的 `directory`/`worktree` 字段或 worktree 域 | ✅ 通过 | 2.0.16 |
+| 6 | 结果获取 | `session.context` 读取会话产物 | ✅ 通过 | 2.0.16 |
 
-## 路径选型（§7.2）
+## 路径选型（§7.2）——最终决定
 
-- **路径 A（优先验证）**：思考模型与开发模型均通过 OpenCode 会话执行。
-  适配层已按路径 A 实现：`SessionCoderExecutor`（会话隔离 + 权限规则 + 工作目录）。
-- **路径 B（兜底）**：思考模型走独立模型 API（只读材料 + 结构化输出），开发模型走
-  OpenCode 编码执行能力，测试由编排器直接执行。
-  当前实现中思考模型走 `ctx.generate.text`（结构化生成、不落会话历史），
-  本质上即路径 B 的思考侧；开发侧按路径 A 实现，能力不足时可降级。
+**采用路径 A**（双 OpenCode 会话）：6 项能力全部满足，开发模型走 OpenCode 会话
+（会话隔离 + 权限规则 + 指定工作目录），思考模型走 `ctx.generate.text` 结构化生成
+（同属路径 A 能力面，不落会话历史、不需要工具）。
+路径 B 保留为未来多模型供应商直连的兜底实现。
 
-**选型决定：待六项能力回填后确认。** 判定规则：
+## 其他验证发现（安装/加载相关）
 
-- 6 项全部 ✅ → 采用路径 A；
-- 4（权限）或 5（工作目录）为 ❌ → 核心流程走路径 B + 人工审批兜底；
-- 3（生命周期）为 ❌ → 取消/超时不可靠，必须启用编排器侧看门狗（已实现超时与预算终止）。
+- 插件包目录入口需为 `index.ts`（`export { default } from "./src/plugin"`）；
+  仅在 `package.json` 声明 `main` 不足以被 `.opencode/plugins/` 自动加载解析。
+- 全局配置 `plugins` 支持 `file:///盘符:/路径` 形式的本地插件；纯 Windows 盘符路径
+  （`D:/...`）可能被静默忽略。
+- 插件按**位置懒加载**：`/api/plugin?location[directory]=...` 查询对应位置才能看到；
+  修改全局插件配置后需重启后台服务（`opencode service restart`）。
+- 命令执行器内投递合成消息（`session.synthetic`）到繁忙会话可能长时间阻塞，
+  已用超时保护包住（`safeSynthetic`）。
 
 ## 递归触发防护验证（§7.3）
 

@@ -54,10 +54,7 @@ export default Plugin.define({
         execute: async (input: { sessionID: string; prompt: { text: string } }) => {
           const requirement = input.prompt.text.replace(/^\s*\/dual\s*/, "").trim();
           if (!requirement) {
-            await context.session.synthetic({
-              sessionID: input.sessionID,
-              text: "用法：/dual <需求描述>",
-            });
+            await safeSynthetic(context, input.sessionID, "用法：/dual <需求描述>");
             return;
           }
           await startRun(context, logger, options, input.sessionID, requirement, { resume: false });
@@ -68,11 +65,16 @@ export default Plugin.define({
         name: "dual-probe",
         description: "P1 六项能力验证（会话隔离/角色模型/生命周期/权限/工作目录/结果获取）",
         execute: async (input: { sessionID: string }) => {
-          const reports = await probeCapabilities(context, { live: true });
-          await context.session.synthetic({
-            sessionID: input.sessionID,
-            text: formatCapabilityReport(reports),
-          });
+          try {
+            const reports = await probeCapabilities(context, { live: true });
+            await safeSynthetic(context, input.sessionID, formatCapabilityReport(reports));
+          } catch (err) {
+            await safeSynthetic(
+              context,
+              input.sessionID,
+              `能力探测失败：${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
         },
       });
 
@@ -82,10 +84,7 @@ export default Plugin.define({
         execute: async (input: { sessionID: string; prompt: { text: string } }) => {
           const requirement = input.prompt.text.replace(/^\s*\/dual-resume\s*/, "").trim();
           if (!requirement) {
-            await context.session.synthetic({
-              sessionID: input.sessionID,
-              text: "用法：/dual-resume <原始需求描述>",
-            });
+            await safeSynthetic(context, input.sessionID, "用法：/dual-resume <原始需求描述>");
             return;
           }
           await startRun(context, logger, options, input.sessionID, requirement, { resume: true });
@@ -127,10 +126,7 @@ async function startRun(
       name: runId,
     });
     if (!guard.acquireWorkspaceLock(workspace.root)) {
-      await ctx.session.synthetic({
-        sessionID,
-        text: "工作区执行锁被占用，本次运行取消（防递归触发）。",
-      });
+      await safeSynthetic(ctx, sessionID, "工作区执行锁被占用，本次运行取消（防递归触发）。");
       return abortedResult(runId, workspace.root);
     }
 
@@ -183,18 +179,37 @@ async function startRun(
       { requirement, resume: opts.resume },
     );
 
-    await ctx.session.synthetic({ sessionID, text: buildReport(result) });
+    await safeSynthetic(ctx, sessionID, buildReport(result));
     return result;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     logger.error({ err: message }, "运行失败");
-    await ctx.session
-      .synthetic({ sessionID, text: `双模型协作运行失败：${message}` })
-      .catch(() => {});
+    await safeSynthetic(ctx, sessionID, `双模型协作运行失败：${message}`);
     return abortedResult(runId, workspace?.root);
   } finally {
     if (workspace) guard.releaseWorkspaceLock(workspace.root);
     await store.close();
+  }
+}
+
+/**
+ * 合成消息投递（带超时保护）：目标会话繁忙时投递可能长时间阻塞，
+ * 命令执行器不得因此悬挂。
+ */
+async function safeSynthetic(
+  ctx: OpenCodeContextLike,
+  sessionID: string,
+  text: string,
+  timeoutMs = 15_000,
+): Promise<void> {
+  try {
+    await Promise.race([
+      ctx.session.synthetic({ sessionID, text }),
+      new Promise((resolve) => setTimeout(resolve, timeoutMs)),
+    ]);
+  } catch (err) {
+    // 投递失败不影响命令完成；报告内容已生成
+    void err;
   }
 }
 
