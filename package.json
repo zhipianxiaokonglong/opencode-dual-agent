@@ -1,0 +1,30 @@
+{
+  "name": "opencode-dual-agent",
+  "version": "0.1.0",
+  "description": "OpenCode 双模型协作编码插件：思考模型规划/评审 + 开发模型写代码 + 真实测试验证",
+  "type": "module",
+  "main": "src/plugin.ts",
+  "exports": {
+    ".": "./src/plugin.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "build": "tsc --noEmit",
+    "demo": "vite-node examples/run-demo.ts"
+  },
+  "engines": {
+    "node": ">=22.5"
+  },
+  "dependencies": {
+    "pino": "^10.3.1",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@opencode/plugin": "^2.0.16",
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "name": "demo-project",
+  "version": "1.0.0",
+  "private": true,
+  "description": "含可复现缺陷的示例项目：add 对字符串数字输入处理错误",
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  }
+}
