@@ -80,7 +80,10 @@ export default Plugin.define({
         host: options.uiHost,
         listModels: async () => {
           try {
-            const models = ((await context.model?.list?.()) ?? []) as Array<Record<string, unknown>>;
+            const raw = (await context.model?.list?.()) as unknown;
+            const models: Array<Record<string, unknown>> = Array.isArray(raw)
+              ? (raw as Array<Record<string, unknown>>)
+              : ((raw as { data?: Array<Record<string, unknown>> })?.data ?? []);
             return models.map((m) => ({
               providerID: String(m.providerID ?? ""),
               id: String(m.id ?? ""),
