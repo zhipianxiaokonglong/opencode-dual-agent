@@ -69,7 +69,15 @@ export class UIChannel {
   /** EventBus 订阅入口：落库后的事件由此推给 UI（脱敏后推送，§8.1）。 */
   sink(): (envelope: UIEventEnvelope) => void {
     return (envelope) => {
-      void this.#emit(redactValue(envelope)).catch((err: unknown) => {
+      const redacted = redactValue(envelope);
+      for (const listener of this.#allListeners) {
+        try {
+          listener(redacted);
+        } catch {
+          // 单个订阅者异常不影响其他订阅者
+        }
+      }
+      void this.#emit(redacted).catch((err: unknown) => {
         this.logger.warn({ err }, "UI 事件推送失败");
       });
     };
@@ -80,6 +88,19 @@ export class UIChannel {
     const bus = this.buses.get(runId);
     if (!bus) return undefined;
     return bus.subscribe((envelope) => listener(redactValue(envelope)));
+  }
+
+  /** 全局广播订阅（runId 发现：UI 先订阅全部，收到 run.started 后再定向订阅）。 */
+  readonly #allListeners = new Set<(envelope: UIEventEnvelope) => void>();
+
+  subscribeAll(listener: (envelope: UIEventEnvelope) => void): () => void {
+    this.#allListeners.add(listener);
+    return () => this.#allListeners.delete(listener);
+  }
+
+  /** 当前活动运行 ID 列表。 */
+  listRuns(): string[] {
+    return [...this.buses.keys()];
   }
 
   /** 供 RPC 注册的方法映射。 */

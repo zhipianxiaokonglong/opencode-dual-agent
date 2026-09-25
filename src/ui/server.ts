@@ -88,16 +88,22 @@ export async function startUIServer(opts: UIServerOptions): Promise<UIServer> {
       });
 
       const send = (data: unknown) => res.write(`data: ${JSON.stringify(data)}\n\n`);
-      try {
-        const replay = (await handlers.replay!({ runId, since }, rpcCtx(res))) as {
-          events: unknown[];
-        };
-        for (const e of replay.events) send(e);
-      } catch {
-        res.write(`data: ${JSON.stringify({ error: "run_not_found", runId })}\n\n`);
+      let unsubscribe: (() => void) | undefined;
+      if (runId) {
+        try {
+          const replay = (await handlers.replay!({ runId, since }, rpcCtx(res))) as {
+            events: unknown[];
+          };
+          for (const e of replay.events) send(e);
+        } catch {
+          res.write(`data: ${JSON.stringify({ error: "run_not_found", runId })}\n\n`);
+        }
+        unsubscribe = opts.channel.subscribe(runId, (envelope) => send(envelope));
+      } else {
+        // 无 runId：广播订阅（UI 用于发现 run.started，随后可定向订阅）
+        unsubscribe = opts.channel.subscribeAll((envelope) => send(envelope));
       }
 
-      const unsubscribe = opts.channel.subscribe(runId, (envelope) => send(envelope));
       const keepAlive = setInterval(() => res.write(": ping\n\n"), 25_000);
       req.on("close", () => {
         clearInterval(keepAlive);
@@ -107,6 +113,11 @@ export async function startUIServer(opts: UIServerOptions): Promise<UIServer> {
     }
 
     // REST
+    if (url.pathname === "/api/runs" && req.method === "GET") {
+      sendJson(res, 200, { runs: opts.channel.listRuns() });
+      return;
+    }
+
     if (url.pathname === "/api/models" && req.method === "GET") {
       const models = (await opts.listModels?.()) ?? [];
       sendJson(res, 200, { models });
